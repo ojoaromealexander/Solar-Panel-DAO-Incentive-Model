@@ -10,10 +10,15 @@
 (define-constant ERR-NOT-MEMBER (err u108))
 (define-constant ERR-INVALID-AMOUNT (err u109))
 (define-constant ERR-PROJECT-COMPLETED (err u110))
+(define-constant ERR-INVALID-ENERGY-DATA (err u111))
+(define-constant ERR-DATA-ALREADY-SUBMITTED (err u112))
+(define-constant ERR-INSUFFICIENT-PERFORMANCE (err u113))
 
 (define-constant VOTING-PERIOD u1440)
 (define-constant MIN-CONTRIBUTION u1000000)
 (define-constant APPROVAL-THRESHOLD u51)
+(define-constant MIN-PERFORMANCE-THRESHOLD u80)
+(define-constant PERFORMANCE-BONUS-RATE u20)
 
 (define-data-var proposal-counter uint u0)
 (define-data-var total-dao-funds uint u0)
@@ -37,6 +42,8 @@
 (define-map project-contributions { proposal-id: uint, contributor: principal } uint)
 (define-map energy-rewards principal uint)
 (define-map installer-certifications principal bool)
+(define-map energy-production { proposal-id: uint, month: uint } { kwh-produced: uint, reported-by: principal, timestamp: uint })
+(define-map project-performance uint { total-kwh: uint, months-active: uint, performance-score: uint })
 
 (define-public (join-dao)
     (let ((caller tx-sender)
@@ -158,6 +165,55 @@
         (map-delete energy-rewards caller)
         (ok rewards)))
 
+(define-public (submit-energy-data (proposal-id uint) (month uint) (kwh-produced uint))
+    (let ((proposal (unwrap! (map-get? proposals proposal-id) ERR-PROPOSAL-NOT-FOUND))
+          (installer (get installer proposal))
+          (current-block burn-block-height)
+          (energy-key { proposal-id: proposal-id, month: month }))
+        (asserts! (is-eq tx-sender installer) ERR-NOT-AUTHORIZED)
+        (asserts! (get executed proposal) ERR-PROPOSAL-NOT-APPROVED)
+        (asserts! (> kwh-produced u0) ERR-INVALID-ENERGY-DATA)
+        (asserts! (is-none (map-get? energy-production energy-key)) ERR-DATA-ALREADY-SUBMITTED)
+        (map-set energy-production energy-key {
+            kwh-produced: kwh-produced,
+            reported-by: installer,
+            timestamp: current-block
+        })
+        (update-project-performance proposal-id kwh-produced)
+        (ok true)))
+
+(define-public (claim-performance-rewards (proposal-id uint))
+    (let ((caller tx-sender)
+          (proposal (unwrap! (map-get? proposals proposal-id) ERR-PROPOSAL-NOT-FOUND))
+          (performance-data (unwrap! (map-get? project-performance proposal-id) ERR-INVALID-PROPOSAL))
+          (performance-score (get performance-score performance-data))
+          (contribution (default-to u0 (map-get? project-contributions { proposal-id: proposal-id, contributor: caller })))
+          (reward-amount (if (>= performance-score MIN-PERFORMANCE-THRESHOLD)
+              (/ (* contribution PERFORMANCE-BONUS-RATE) u100)
+              u0)))
+        (asserts! (is-some (map-get? dao-members caller)) ERR-NOT-MEMBER)
+        (asserts! (get executed proposal) ERR-PROPOSAL-NOT-APPROVED)
+        (asserts! (> contribution u0) ERR-INSUFFICIENT-FUNDS)
+        (asserts! (>= performance-score MIN-PERFORMANCE-THRESHOLD) ERR-INSUFFICIENT-PERFORMANCE)
+        (let ((current-rewards (default-to u0 (map-get? energy-rewards caller))))
+            (map-set energy-rewards caller (+ current-rewards reward-amount)))
+        (ok reward-amount)))
+
+(define-private (update-project-performance (proposal-id uint) (kwh-this-month uint))
+    (let ((current-performance (default-to { total-kwh: u0, months-active: u0, performance-score: u0 } 
+                               (map-get? project-performance proposal-id)))
+          (new-total-kwh (+ (get total-kwh current-performance) kwh-this-month))
+          (new-months-active (+ (get months-active current-performance) u1))
+          (average-monthly-kwh (/ new-total-kwh new-months-active))
+          (calculated-score (/ (* average-monthly-kwh u100) u1200))
+          (performance-score (if (> calculated-score u100) u100 calculated-score)))
+        (map-set project-performance proposal-id {
+            total-kwh: new-total-kwh,
+            months-active: new-months-active,
+            performance-score: performance-score
+        })
+        performance-score))
+
 (define-public (emergency-withdraw (amount uint))
     (begin
         (asserts! (is-eq tx-sender CONTRACT-OWNER) ERR-NOT-AUTHORIZED)
@@ -196,6 +252,21 @@
     (let ((member-data (map-get? dao-members member)))
         (match member-data
             data (get contribution data)
+            u0)))
+
+(define-read-only (get-energy-production (proposal-id uint) (month uint))
+    (map-get? energy-production { proposal-id: proposal-id, month: month }))
+
+(define-read-only (get-project-performance (proposal-id uint))
+    (map-get? project-performance proposal-id))
+
+(define-read-only (calculate-performance-reward (proposal-id uint) (contributor principal))
+    (let ((performance-data (map-get? project-performance proposal-id))
+          (contribution (default-to u0 (map-get? project-contributions { proposal-id: proposal-id, contributor: contributor }))))
+        (match performance-data
+            data (if (>= (get performance-score data) MIN-PERFORMANCE-THRESHOLD)
+                (/ (* contribution PERFORMANCE-BONUS-RATE) u100)
+                u0)
             u0)))
 
 (define-read-only (get-proposal-status (proposal-id uint))
