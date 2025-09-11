@@ -13,6 +13,11 @@
 (define-constant ERR-INVALID-ENERGY-DATA (err u111))
 (define-constant ERR-DATA-ALREADY-SUBMITTED (err u112))
 (define-constant ERR-INSUFFICIENT-PERFORMANCE (err u113))
+(define-constant ERR-MILESTONE-NOT-FOUND (err u114))
+(define-constant ERR-MILESTONE-ALREADY-COMPLETED (err u115))
+(define-constant ERR-INVALID-MILESTONE (err u116))
+(define-constant ERR-MILESTONES-NOT-SET (err u117))
+(define-constant ERR-ALL-MILESTONES-COMPLETED (err u118))
 
 (define-constant VOTING-PERIOD u1440)
 (define-constant MIN-CONTRIBUTION u1000000)
@@ -44,6 +49,8 @@
 (define-map installer-certifications principal bool)
 (define-map energy-production { proposal-id: uint, month: uint } { kwh-produced: uint, reported-by: principal, timestamp: uint })
 (define-map project-performance uint { total-kwh: uint, months-active: uint, performance-score: uint })
+(define-map project-milestones { proposal-id: uint, milestone-id: uint } { description: (string-ascii 128), funding-percentage: uint, completed: bool, completed-at: uint })
+(define-map project-milestone-count uint uint)
 
 (define-public (join-dao)
     (let ((caller tx-sender)
@@ -120,6 +127,41 @@
             (map-set proposals proposal-id (merge proposal { approved: false })))
         (ok (>= approval-percentage APPROVAL-THRESHOLD))))
 
+(define-public (create-project-milestones (proposal-id uint) (milestones (list 10 { description: (string-ascii 128), funding-percentage: uint })))
+    (let ((proposal (unwrap! (map-get? proposals proposal-id) ERR-PROPOSAL-NOT-FOUND))
+          (caller tx-sender))
+        (asserts! (is-eq caller (get creator proposal)) ERR-NOT-AUTHORIZED)
+        (asserts! (get approved proposal) ERR-PROPOSAL-NOT-APPROVED)
+        (asserts! (not (get executed proposal)) ERR-PROJECT-COMPLETED)
+        (asserts! (is-none (map-get? project-milestone-count proposal-id)) ERR-MILESTONES-NOT-SET)
+        (let ((total-percentage (fold + (map get-funding-percentage milestones) u0)))
+            (asserts! (is-eq total-percentage u100) ERR-INVALID-MILESTONE)
+            (map-set project-milestone-count proposal-id (len milestones))
+            (ok (map create-milestone-entry (enumerate-milestones milestones proposal-id))))))
+
+(define-private (get-funding-percentage (milestone { description: (string-ascii 128), funding-percentage: uint }))
+    (get funding-percentage milestone))
+
+(define-private (enumerate-milestones (milestones (list 10 { description: (string-ascii 128), funding-percentage: uint })) (proposal-id uint))
+    (map create-milestone-with-id milestones (generate-milestone-ids (len milestones) proposal-id)))
+
+(define-private (generate-milestone-ids (count uint) (proposal-id uint))
+    (map + (list u1 u2 u3 u4 u5 u6 u7 u8 u9 u10) (list proposal-id proposal-id proposal-id proposal-id proposal-id proposal-id proposal-id proposal-id proposal-id proposal-id)))
+
+(define-private (create-milestone-with-id (milestone { description: (string-ascii 128), funding-percentage: uint }) (id-data uint))
+    { milestone: milestone, milestone-id: (mod id-data u100), proposal-id: (/ id-data u100) })
+
+(define-private (create-milestone-entry (milestone-data { milestone: { description: (string-ascii 128), funding-percentage: uint }, milestone-id: uint, proposal-id: uint }))
+    (let ((milestone-key { proposal-id: (get proposal-id milestone-data), milestone-id: (get milestone-id milestone-data) })
+          (milestone-info (get milestone milestone-data)))
+        (map-set project-milestones milestone-key {
+            description: (get description milestone-info),
+            funding-percentage: (get funding-percentage milestone-info),
+            completed: false,
+            completed-at: u0
+        })
+        true))
+
 (define-public (contribute-to-project (proposal-id uint) (amount uint))
     (let ((caller tx-sender)
           (proposal (unwrap! (map-get? proposals proposal-id) ERR-PROPOSAL-NOT-FOUND))
@@ -132,6 +174,47 @@
         (try! (stx-transfer? amount caller (as-contract tx-sender)))
         (map-set project-contributions contribution-key (+ current-contribution amount))
         (ok true)))
+
+(define-public (complete-milestone (proposal-id uint) (milestone-id uint))
+    (let ((proposal (unwrap! (map-get? proposals proposal-id) ERR-PROPOSAL-NOT-FOUND))
+          (milestone-key { proposal-id: proposal-id, milestone-id: milestone-id })
+          (milestone (unwrap! (map-get? project-milestones milestone-key) ERR-MILESTONE-NOT-FOUND))
+          (current-block burn-block-height))
+        (asserts! (is-eq tx-sender (get installer proposal)) ERR-NOT-AUTHORIZED)
+        (asserts! (get approved proposal) ERR-PROPOSAL-NOT-APPROVED)
+        (asserts! (not (get completed milestone)) ERR-MILESTONE-ALREADY-COMPLETED)
+        (map-set project-milestones milestone-key (merge milestone {
+            completed: true,
+            completed-at: current-block
+        }))
+        (let ((release-amount (/ (* (get funding-goal proposal) (get funding-percentage milestone)) u100)))
+            (try! (as-contract (stx-transfer? release-amount tx-sender (get installer proposal))))
+            (map-set proposals proposal-id (merge proposal { 
+                funds-released: (+ (get funds-released proposal) release-amount)
+            }))
+            (ok release-amount))))
+
+(define-public (mark-project-completed (proposal-id uint))
+    (let ((proposal (unwrap! (map-get? proposals proposal-id) ERR-PROPOSAL-NOT-FOUND))
+          (milestone-count (default-to u0 (map-get? project-milestone-count proposal-id))))
+        (asserts! (is-eq tx-sender CONTRACT-OWNER) ERR-NOT-AUTHORIZED)
+        (asserts! (get approved proposal) ERR-PROPOSAL-NOT-APPROVED)
+        (asserts! (not (get executed proposal)) ERR-PROJECT-COMPLETED)
+        (asserts! (> milestone-count u0) ERR-MILESTONES-NOT-SET)
+        (map-set proposals proposal-id (merge proposal { executed: true }))
+        (ok true)))
+
+(define-read-only (count-completed-milestones (proposal-id uint) (milestone-count uint))
+    (+ (if (and (> milestone-count u0) (match (map-get? project-milestones { proposal-id: proposal-id, milestone-id: u1 }) milestone (get completed milestone) false)) u1 u0)
+       (if (and (> milestone-count u1) (match (map-get? project-milestones { proposal-id: proposal-id, milestone-id: u2 }) milestone (get completed milestone) false)) u1 u0)
+       (if (and (> milestone-count u2) (match (map-get? project-milestones { proposal-id: proposal-id, milestone-id: u3 }) milestone (get completed milestone) false)) u1 u0)
+       (if (and (> milestone-count u3) (match (map-get? project-milestones { proposal-id: proposal-id, milestone-id: u4 }) milestone (get completed milestone) false)) u1 u0)
+       (if (and (> milestone-count u4) (match (map-get? project-milestones { proposal-id: proposal-id, milestone-id: u5 }) milestone (get completed milestone) false)) u1 u0)
+       (if (and (> milestone-count u5) (match (map-get? project-milestones { proposal-id: proposal-id, milestone-id: u6 }) milestone (get completed milestone) false)) u1 u0)
+       (if (and (> milestone-count u6) (match (map-get? project-milestones { proposal-id: proposal-id, milestone-id: u7 }) milestone (get completed milestone) false)) u1 u0)
+       (if (and (> milestone-count u7) (match (map-get? project-milestones { proposal-id: proposal-id, milestone-id: u8 }) milestone (get completed milestone) false)) u1 u0)
+       (if (and (> milestone-count u8) (match (map-get? project-milestones { proposal-id: proposal-id, milestone-id: u9 }) milestone (get completed milestone) false)) u1 u0)
+       (if (and (> milestone-count u9) (match (map-get? project-milestones { proposal-id: proposal-id, milestone-id: u10 }) milestone (get completed milestone) false)) u1 u0)))
 
 (define-public (release-funds (proposal-id uint) (amount uint))
     (let ((proposal (unwrap! (map-get? proposals proposal-id) ERR-PROPOSAL-NOT-FOUND)))
@@ -268,6 +351,12 @@
                 (/ (* contribution PERFORMANCE-BONUS-RATE) u100)
                 u0)
             u0)))
+
+(define-read-only (get-milestone (proposal-id uint) (milestone-id uint))
+    (map-get? project-milestones { proposal-id: proposal-id, milestone-id: milestone-id }))
+
+(define-read-only (get-milestone-count (proposal-id uint))
+    (default-to u0 (map-get? project-milestone-count proposal-id)))
 
 (define-read-only (get-proposal-status (proposal-id uint))
     (let ((proposal (map-get? proposals proposal-id)))
