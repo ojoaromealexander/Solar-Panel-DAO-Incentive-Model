@@ -18,15 +18,23 @@
 (define-constant ERR-INVALID-MILESTONE (err u116))
 (define-constant ERR-MILESTONES-NOT-SET (err u117))
 (define-constant ERR-ALL-MILESTONES-COMPLETED (err u118))
+(define-constant ERR-INVALID-CARBON-CREDITS (err u119))
+(define-constant ERR-INSUFFICIENT-CARBON-CREDITS (err u120))
+(define-constant ERR-CARBON-CREDIT-NOT-FOUND (err u121))
+(define-constant ERR-INVALID-CARBON-PRICE (err u122))
+(define-constant ERR-CARBON-CREDIT-ALREADY-SOLD (err u123))
 
 (define-constant VOTING-PERIOD u1440)
 (define-constant MIN-CONTRIBUTION u1000000)
 (define-constant APPROVAL-THRESHOLD u51)
 (define-constant MIN-PERFORMANCE-THRESHOLD u80)
 (define-constant PERFORMANCE-BONUS-RATE u20)
+(define-constant CARBON-OFFSET-RATE u50)
+(define-constant MIN-CARBON-PRICE u100)
 
 (define-data-var proposal-counter uint u0)
 (define-data-var total-dao-funds uint u0)
+(define-data-var carbon-credit-counter uint u0)
 
 (define-map dao-members principal { contribution: uint, joined-at: uint })
 (define-map proposals uint {
@@ -51,6 +59,18 @@
 (define-map project-performance uint { total-kwh: uint, months-active: uint, performance-score: uint })
 (define-map project-milestones { proposal-id: uint, milestone-id: uint } { description: (string-ascii 128), funding-percentage: uint, completed: bool, completed-at: uint })
 (define-map project-milestone-count uint uint)
+(define-map carbon-credits uint {
+    project-id: uint,
+    credits-amount: uint,
+    price-per-credit: uint,
+    created-by: principal,
+    created-at: uint,
+    sold: bool,
+    buyer: (optional principal),
+    sold-at: (optional uint)
+})
+(define-map project-carbon-balance uint uint)
+(define-map member-carbon-holdings principal uint)
 
 (define-public (join-dao)
     (let ((caller tx-sender)
@@ -281,6 +301,93 @@
         (let ((current-rewards (default-to u0 (map-get? energy-rewards caller))))
             (map-set energy-rewards caller (+ current-rewards reward-amount)))
         (ok reward-amount)))
+
+;; Carbon Credit Trading System Functions
+
+(define-public (generate-carbon-credits (proposal-id uint) (energy-kwh uint))
+    (let ((proposal (unwrap! (map-get? proposals proposal-id) ERR-PROPOSAL-NOT-FOUND))
+          (caller tx-sender)
+          (carbon-credits-generated (/ (* energy-kwh CARBON-OFFSET-RATE) u100))
+          (current-balance (default-to u0 (map-get? project-carbon-balance proposal-id))))
+        (asserts! (is-eq caller (get installer proposal)) ERR-NOT-AUTHORIZED)
+        (asserts! (get executed proposal) ERR-PROPOSAL-NOT-APPROVED)
+        (asserts! (> energy-kwh u0) ERR-INVALID-CARBON-CREDITS)
+        (map-set project-carbon-balance proposal-id (+ current-balance carbon-credits-generated))
+        (let ((member-current (default-to u0 (map-get? member-carbon-holdings caller))))
+            (map-set member-carbon-holdings caller (+ member-current carbon-credits-generated)))
+        (ok carbon-credits-generated)))
+
+(define-public (list-carbon-credits-for-sale (proposal-id uint) (credits-amount uint) (price-per-credit uint))
+    (let ((proposal (unwrap! (map-get? proposals proposal-id) ERR-PROPOSAL-NOT-FOUND))
+          (caller tx-sender)
+          (current-balance (default-to u0 (map-get? project-carbon-balance proposal-id)))
+          (credit-id (+ (var-get carbon-credit-counter) u1))
+          (current-block burn-block-height))
+        (asserts! (is-eq caller (get installer proposal)) ERR-NOT-AUTHORIZED)
+        (asserts! (get executed proposal) ERR-PROPOSAL-NOT-APPROVED)
+        (asserts! (> credits-amount u0) ERR-INVALID-CARBON-CREDITS)
+        (asserts! (>= price-per-credit MIN-CARBON-PRICE) ERR-INVALID-CARBON-PRICE)
+        (asserts! (>= current-balance credits-amount) ERR-INSUFFICIENT-CARBON-CREDITS)
+        (map-set project-carbon-balance proposal-id (- current-balance credits-amount))
+        (map-set carbon-credits credit-id {
+            project-id: proposal-id,
+            credits-amount: credits-amount,
+            price-per-credit: price-per-credit,
+            created-by: caller,
+            created-at: current-block,
+            sold: false,
+            buyer: none,
+            sold-at: none
+        })
+        (var-set carbon-credit-counter credit-id)
+        (ok credit-id)))
+
+(define-public (buy-carbon-credits (credit-id uint))
+    (let ((credit-listing (unwrap! (map-get? carbon-credits credit-id) ERR-CARBON-CREDIT-NOT-FOUND))
+          (caller tx-sender)
+          (total-cost (* (get credits-amount credit-listing) (get price-per-credit credit-listing)))
+          (current-block burn-block-height)
+          (member-current (default-to u0 (map-get? member-carbon-holdings caller))))
+        (asserts! (is-some (map-get? dao-members caller)) ERR-NOT-MEMBER)
+        (asserts! (not (get sold credit-listing)) ERR-CARBON-CREDIT-ALREADY-SOLD)
+        (try! (stx-transfer? total-cost caller (get created-by credit-listing)))
+        (map-set carbon-credits credit-id (merge credit-listing {
+            sold: true,
+            buyer: (some caller),
+            sold-at: (some current-block)
+        }))
+        (map-set member-carbon-holdings caller (+ member-current (get credits-amount credit-listing)))
+        (ok total-cost)))
+
+(define-public (retire-carbon-credits (amount uint))
+    (let ((caller tx-sender)
+          (current-holdings (default-to u0 (map-get? member-carbon-holdings caller))))
+        (asserts! (is-some (map-get? dao-members caller)) ERR-NOT-MEMBER)
+        (asserts! (> amount u0) ERR-INVALID-CARBON-CREDITS)
+        (asserts! (>= current-holdings amount) ERR-INSUFFICIENT-CARBON-CREDITS)
+        (map-set member-carbon-holdings caller (- current-holdings amount))
+        (ok amount)))
+
+;; Carbon Credit Read-Only Functions
+
+(define-read-only (get-carbon-credit-listing (credit-id uint))
+    (map-get? carbon-credits credit-id))
+
+(define-read-only (get-project-carbon-balance (proposal-id uint))
+    (default-to u0 (map-get? project-carbon-balance proposal-id)))
+
+(define-read-only (get-member-carbon-holdings (member principal))
+    (default-to u0 (map-get? member-carbon-holdings member)))
+
+(define-read-only (calculate-carbon-credits (energy-kwh uint))
+    (/ (* energy-kwh CARBON-OFFSET-RATE) u100))
+
+(define-read-only (get-carbon-credit-stats)
+    {
+        total-credits-listed: (var-get carbon-credit-counter),
+        carbon-offset-rate: CARBON-OFFSET-RATE,
+        min-carbon-price: MIN-CARBON-PRICE
+    })
 
 (define-private (update-project-performance (proposal-id uint) (kwh-this-month uint))
     (let ((current-performance (default-to { total-kwh: u0, months-active: u0, performance-score: u0 } 
