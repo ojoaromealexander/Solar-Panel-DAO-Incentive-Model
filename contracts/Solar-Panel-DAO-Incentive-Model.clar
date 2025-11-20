@@ -23,6 +23,8 @@
 (define-constant ERR-CARBON-CREDIT-NOT-FOUND (err u121))
 (define-constant ERR-INVALID-CARBON-PRICE (err u122))
 (define-constant ERR-CARBON-CREDIT-ALREADY-SOLD (err u123))
+(define-constant ERR-CANNOT-DELEGATE-TO-SELF (err u124))
+(define-constant ERR-DELEGATION-LOOP (err u125))
 
 (define-constant VOTING-PERIOD u1440)
 (define-constant MIN-CONTRIBUTION u1000000)
@@ -71,6 +73,8 @@
 })
 (define-map project-carbon-balance uint uint)
 (define-map member-carbon-holdings principal uint)
+(define-map vote-delegation principal principal)
+(define-map delegated-vote-count principal uint)
 
 (define-public (join-dao)
     (let ((caller tx-sender)
@@ -126,13 +130,14 @@
           (proposal (unwrap! (map-get? proposals proposal-id) ERR-PROPOSAL-NOT-FOUND))
           (current-block burn-block-height)
           (member-data (unwrap! (map-get? dao-members caller) ERR-NOT-MEMBER))
-          (vote-key { proposal-id: proposal-id, voter: caller }))
+          (vote-key { proposal-id: proposal-id, voter: caller })
+          (vote-weight (+ u1 (default-to u0 (map-get? delegated-vote-count caller)))))
         (asserts! (is-none (map-get? project-votes vote-key)) ERR-ALREADY-VOTED)
         (asserts! (<= current-block (get voting-ends-at proposal)) ERR-VOTING-PERIOD-ENDED)
         (map-set project-votes vote-key vote)
         (if vote
-            (map-set proposals proposal-id (merge proposal { yes-votes: (+ (get yes-votes proposal) u1) }))
-            (map-set proposals proposal-id (merge proposal { no-votes: (+ (get no-votes proposal) u1) })))
+            (map-set proposals proposal-id (merge proposal { yes-votes: (+ (get yes-votes proposal) vote-weight) }))
+            (map-set proposals proposal-id (merge proposal { no-votes: (+ (get no-votes proposal) vote-weight) })))
         (ok true)))
 
 (define-public (finalize-proposal (proposal-id uint))
@@ -475,3 +480,47 @@
                 funding-progress: (/ (* (get funds-released data) u100) (get funding-goal data))
             }
             { status: "not-found", funding-progress: u0 })))
+
+(define-public (delegate-vote (delegate-to principal))
+    (let ((caller tx-sender)
+          (current-delegate (map-get? vote-delegation caller))
+          (delegate-member-check (map-get? dao-members delegate-to)))
+        (asserts! (is-some (map-get? dao-members caller)) ERR-NOT-MEMBER)
+        (asserts! (is-some delegate-member-check) ERR-NOT-MEMBER)
+        (asserts! (not (is-eq caller delegate-to)) ERR-CANNOT-DELEGATE-TO-SELF)
+        (asserts! (is-none (map-get? vote-delegation delegate-to)) ERR-DELEGATION-LOOP)
+        (match current-delegate
+            old-delegate
+                (let ((old-count (default-to u0 (map-get? delegated-vote-count old-delegate))))
+                    (if (> old-count u0)
+                        (map-set delegated-vote-count old-delegate (- old-count u1))
+                        true))
+            true)
+        (map-set vote-delegation caller delegate-to)
+        (let ((new-count (default-to u0 (map-get? delegated-vote-count delegate-to))))
+            (map-set delegated-vote-count delegate-to (+ new-count u1)))
+        (ok true)))
+
+(define-public (revoke-delegation)
+    (let ((caller tx-sender)
+          (current-delegate (map-get? vote-delegation caller)))
+        (asserts! (is-some (map-get? dao-members caller)) ERR-NOT-MEMBER)
+        (asserts! (is-some current-delegate) ERR-NOT-AUTHORIZED)
+        (match current-delegate
+            delegate
+                (let ((delegate-count (default-to u0 (map-get? delegated-vote-count delegate))))
+                    (if (> delegate-count u0)
+                        (map-set delegated-vote-count delegate (- delegate-count u1))
+                        true)
+                    (map-delete vote-delegation caller)
+                    (ok true))
+            ERR-NOT-AUTHORIZED)))
+
+(define-read-only (get-vote-delegate (member principal))
+    (map-get? vote-delegation member))
+
+(define-read-only (get-delegated-vote-count (member principal))
+    (default-to u0 (map-get? delegated-vote-count member)))
+
+(define-read-only (get-total-voting-power (member principal))
+    (+ u1 (get-delegated-vote-count member)))
